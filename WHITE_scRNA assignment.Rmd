@@ -1,0 +1,375 @@
+---
+title: "scRNA Dataset"
+author: "Jess White"
+date: "4/29/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load packages, message=FALSE, warning=FALSE}
+library(scran)
+library(scater)
+library(pheatmap)
+library(tidyverse)
+```
+
+```{r intro, message=FALSE, warning=FALSE}
+# BiocManager::install("scRNAseq")
+figure.path <- "C:/Users/jessb/OneDrive/MS-CB/Functional Interpretation of High-Throughput Data/Assignments/Assignment 4"
+
+## Load pancreas data from Baron etal. (2016)
+## C:\Users\jessb\AppData\Local\ExperimentHub\ExperimentHub\Cache
+baron.sce <- scRNAseq::BaronPancreasData(which = 'human')
+
+## Pancreas cells gene markers. Taken from Table S2, from Baron etal,  Cell Syst. 2016 Oct 26;3(4):346-360.e4.
+cell.markers <- tibble(cell=c("Alpha", "Beta", "Delta", "Gamma","Epsilon", "Ductal", 
+                              "Acinar", "Stellate","Vascular", "Macrophage", "CytotoxicT",
+                              "Mast"), 
+                              gene=c("GCG", "INS", "SST", "PPY", "GHRL", "KRT19",
+                              "CPA1" ,"PDGFRB", "VWF", "CD163", "CD3D", "TPSAB1"))
+
+## Additional pancreas from Grun etal. (2016)
+# grun.sce <- scRNAseq::GrunPancreasData()
+```
+
+```{r annotate, message=FALSE}
+Annotate <- function(sce.obj)
+{
+  
+  ## use anyone of these packages to annotate the genes for 
+  ## ids, genomic location and description
+  # library(Organism.dplyr)
+  # library(EnsDb.Hsapiens.v86)
+  
+  library(AnnotationHub)
+  
+  ens.GRCh38 <- AnnotationHub()[["AH73881"]]
+  
+  genenames <- rownames(sce.obj)
+  
+  geneids <- mapIds(ens.GRCh38,
+                    keys = genenames,
+                    keytype = "GENENAME",
+                    column = "GENEID")
+
+  locations <- mapIds(ens.GRCh38,
+                      keys = genenames,
+                      keytype = "GENENAME",
+                      column = "SEQNAME")
+
+  descriptions <- mapIds(ens.GRCh38,
+                         keys = genenames,
+                         keytype = "GENENAME",
+                         column = "DESCRIPTION")
+
+  ##Add gene annotation
+  rowData(sce.obj)$geneids <- geneids
+  rowData(sce.obj)$locations <- locations
+  rowData(sce.obj)$descriptions <- descriptions
+  
+  return(sce.obj)
+}
+
+## Annotate
+baron.sce <- Annotate(baron.sce)
+```
+
+```{r filter, message=FALSE, warning=FALSE}
+FilterNQC <- function(sce.obj, plot.path=NULL, max_mito_frac=0.15)
+{
+  library(ggplot2)
+  
+  # max_mito_frac <- 0.15
+  ## find mitochondrial genes
+  is.mito <- which(rowData(sce.obj)$locations=="MT")
+
+  ## compute cell QC
+  qc.cell <- perCellQCMetrics(sce.obj, subsets=list(Mito=is.mito))
+  qc.cell.df <- cbind(as.numeric(qc.cell$sum),
+                      as.numeric(qc.cell$detected),
+                      as.numeric(qc.cell$subsets_Mito_percent),
+                      colData(sce.obj)$donor)
+  qc.cell.df <- as.data.frame(qc.cell.df, row.names = colnames(sce.obj))
+  colnames(qc.cell.df) = c('sum', 'detected', 'mito_percent', 'donor')
+
+  ## compute gene QC
+  # qc.gene <- apply(assay(sce.obj), 2, function(x) length(which(x>0))) 
+  # qc.cell.df <- cbind(qc.cell.df, qc.gene)
+  # colnames(qc.cell.df) = c('sum', 'detected', 'mito_percent', 'donor', 'genes')
+  
+  ## violin plot
+  violin_cell <- ggplot(qc.cell.df, aes(x=donor, y=mito_percent)) + 
+    geom_violin(trim=FALSE) + 
+    labs(y = "% of UMIs mitochondrial", x="Donors")
+  ggsave("images/violin_cell.png", plot = violin_cell, path = plot.path)
+
+  violin_gene <- ggplot(qc.cell.df, aes(x=donor, y=detected)) + 
+    geom_violin(trim=FALSE) + 
+    labs(y = "Number of genes expressed", x="Donors")
+  ggsave("images/violin_gene.png", plot = violin_gene, path = plot.path)
+
+  violin_umi <- ggplot(qc.cell.df, aes(x=donor, y=sum)) +
+    geom_violin(trim=FALSE) +
+    labs(y = "Number of genes expressed", x="Donors")
+  ggsave("images/violin_umi.png", plot = violin_umi, path = plot.path)
+
+  ## use `quickPerCellQC` function for filtering cells
+  ## Add diagnostic plot
+  discarded <- quickPerCellQC(qc.cell, 
+                              percent_subsets=c("subsets_Mito_percent",
+                                                         "detected"))
+  colData(sce.obj) <- cbind(colData(sce.obj), qc.cell, discarded)
+  
+  ## filter by low number of detected genes & plot
+  print(plotColData(sce.obj, x="donor", y="detected",
+                    colour_by="low_lib_size"))
+  print(plotColData(sce.obj, x="donor", y="detected",
+                    colour_by="low_n_features"))
+  print(plotColData(sce.obj, x="donor", y="detected",
+                    colour_by="high_detected"))
+  print(plotColData(sce.obj, x="donor", y="subsets_Mito_percent",
+                    colour_by="high_subsets_Mito_percent"))
+
+  ## remove cells with high mt
+  sce.obj <- sce.obj[, !discarded$high_subsets_Mito_percent]
+
+  return(sce.obj)
+}
+
+##Filter
+baron.sce <- FilterNQC(baron.sce, plot.path = figure.path)
+```
+
+```{r normalize, message=FALSE, warning=FALSE}
+Normalize <- function(sce.obj, sctransform=FALSE, plot.path=NULL)
+{
+  ## normalize by deconvolution 
+  set.seed(100)
+  clust.sce <- quickCluster(sce.obj)
+  deconv.sf.sce <- calculateSumFactors(sce.obj, cluster=clust.sce)
+  colData(sce.obj) <- cbind(colData(sce.obj), clust.sce, deconv.sf.sce)
+  
+  ## plot comparison between size factors
+  # png(file=paste0(plot.path, "/images/size_factors.png"))
+  # plot(clust.sce, deconv.sf.sce)
+  # dev.off()
+  col_data <- as.data.frame(colData(sce.obj))
+  size_factor <- ggplot(col_data, aes(x = clust.sce, y = deconv.sf.sce)) +
+    geom_boxplot() +
+    labs(x = "Clusters", y = "Deconvolution size factor")
+    
+  ggsave("images/size_factor.png", plot = size_factor, path = plot.path)
+  
+  ## transform to log normal counts using deconvolution size factor
+  sce.obj <- logNormCounts(sce.obj)
+  
+  ## challenge Q: alternative use of sctransform
+  
+  return(sce.obj)
+}
+
+## Normalize
+baron.sce <- Normalize(baron.sce, sctransform=FALSE, plot.path= figure.path)
+```
+
+```{r feature, message=FALSE, warning=FALSE}
+FeatureSelection <-function(sce.obj, plot.path=NULL)
+{
+ 
+  ## model gene variance
+  dec <- modelGeneVar(sce.obj)
+  # dec.df <- as.data.frame(dec)
+
+  ## plot mean- variadec.df
+  plot(dec$mean, dec$total, xlab="Mean log-expression", ylab="Variance")
+  print(curve(metadata(dec)$trend(x), col="blue", add=TRUE))
+
+  ## select HVG either by number or FDR threshold
+  hvg <- getTopHVGs(dec, fdr.threshold=0.05)
+
+  return(hvg)
+}
+
+## Feature selection
+baron.hvg <- FeatureSelection(baron.sce, plot.path = figure.path)
+```
+
+```{r cluster}
+Cluster <- function(sce.obj, hvg.obj, plot.path=NULL)
+{
+  ## remeber to set.seed for reproducible results
+  ## moved up as scater manual suggested set seed for runPCA
+  set.seed(100)
+  
+  ## run PCA
+  sce.obj <- runPCA(sce.obj, subset_row=hvg.obj)
+  attr(reducedDim(sce.obj), "percentVar") <- attr(reducedDim(sce.obj),
+                                                  "percentVar")/100
+
+  ## select meaningful number of dimensions and plot
+  y <- attr(reducedDim(sce.obj), "percentVar")
+  x <- seq(1, length(y))
+  print(plot(x, y, main = "Variance Explained by Principal Components",
+             xlab = "PC", ylab = "Percent Variance Explained"))
+  
+  ## intended to collect PCs that explained 80% of var, but >50
+  # for (n in x){
+  #  if (sum(y[1:n]) < 0.8){
+  #    next
+  #  } else {
+  #    optimal_n <- n
+  #    print(cat("The number of principal components that explain 
+  #              80% of the variation are", optimal_))
+  #    break
+  #  }
+  # }
+
+  ## reduce dim by PCA and plot
+  print(plotPCA(sce.obj, ncomponents = 7, colour_by = "label"))
+
+  ## run TSNE and plot
+  ## ran on pre-existing PCA results to speed via low rank approximation
+  ## selected number of PCs to include using elbow method
+  sce.obj <- runTSNE(sce.obj, perplexity=50, dimred="PCA", n_dimred=7)
+  print(plotReducedDim(sce.obj, dimred = "TSNE", colour_by = "label"))
+
+  ## run UMAP and plot
+  library(uwot)
+  sce.obj <- runUMAP(sce.obj)
+  print(plotReducedDim(sce.obj, dimred = "UMAP", colour_by = "label"))
+
+  ## build shared nearest-neighbor graph and plot
+  g <- buildSNNGraph(sce.obj, use.dimred="PCA")
+  clusters <- igraph::cluster_louvain(g)$membership
+  sce.obj$clusters <- factor(clusters)
+  print(table(sce.obj$clusters))
+  print(plotReducedDim(sce.obj, dimred = "TSNE", 
+                       colour_by = "clusters", text_by = "clusters"))
+
+  ## cluster modularity and heatmap
+  ratio <- clusterModularity(g, clusters, as.ratio=TRUE)
+  print(pheatmap(log10(ratio+1), cluster_cols=FALSE, cluster_rows=FALSE,
+                 col=rev(heat.colors(100))))
+
+  ## graph of clusters and plot
+  ## not sure what's supposed to be here - thought I graphed SNN clusters above
+
+  return(sce.obj)
+}
+
+## cluster
+baron.sce <- Cluster(baron.sce, baron.hvg, plot.path = figure.path)
+```
+
+```{r markers, message=FALSE, warning=FALSE}
+MarkerGenes <- function(sce.obj, plot.path=NULL)
+{
+  ## Find stringent markers. Only genes that are unique to each cluster 
+  ## are identified. e.g. Insulin will be missed
+  markers_unique <- findMarkers(sce.obj, sce.obj$clusters, pval.type="all")
+  
+  ## find any markers
+  markers_any <- findMarkers(sce.obj, sce.obj$clusters, pval.type="any")
+  
+  ## plot insulin marker
+  INS_fold <- 1
+  for (n in seq(3, length(markers_any)+3-1)){
+    INS_fold <- c(INS_fold, markers_any[[1]][grep("^INS$",
+                                                  rownames(markers_any[[1]])), n])
+  }
+  
+  INS <- numeric(length=length(sce.obj$clusters))
+  for (n in seq(1, length(sce.obj$clusters))){
+    INS[n] <- INS_fold[sce.obj$clusters[n]]
+  }
+  sce.obj$INS <- INS
+  
+  print(plotReducedDim(sce.obj, dimred = "TSNE",
+                       colour_by = "INS", text_by = "clusters"))
+  
+  ## find and plot markers for a specific cluster
+  test <- as.data.frame(markers_unique[[1]][2], row.names = rownames(markers_unique))
+  clust1_heatmap <- as.matrix(markers_unique[[1]]
+                              [which(test<0.05), 2:length(markers_unique)+1])
+  
+  print(pheatmap(clust1_heatmap, main = "Cluster 1 logFC for DE Markers"))
+  
+  return(markers_unique)
+}
+
+## Marker genes
+baron.markers <- MarkerGenes(baron.sce, plot.path = figure.path)
+```
+
+```{r annotate_clust, message=FALSE, warning=FALSE, out.height="200%"}
+AnnotateClusters <- function(sce.obj, type.markers, plot.path=NULL)
+{
+  library(AUCell)
+  cells_rankings <- AUCell_buildRankings(assay(sce.obj))
+  
+  library(GSEABase)
+  for (n in seq(1, dim(type.markers)[1])){
+    assign(paste0("gs", n), 
+           GeneSet(type.markers$gene[n], setName=type.markers$cell[n]))
+  }
+  
+  ## didn't have time to generalize this 
+  # names_gs <- paste("gs", c(1:dim(type.markers)[1]), sep = "")
+  gsc <- GeneSetCollection(gs1, gs2, gs3, gs4, gs5, gs6,
+                           gs7, gs8, gs9, gs10, gs11, gs12)
+
+  ## Annotate the clusters using type.markers
+  cells_AUC <- AUCell_calcAUC(gsc, cells_rankings,
+                              aucMaxRank=nrow(cells_rankings)*0.05)
+  
+  # par(mfrow=c(4,3))
+  cells_assignment <- AUCell_exploreThresholds(cells_AUC, plotHist=TRUE, 
+                                               nCores=1, assign=TRUE)
+  
+  selectedThresholds <- getThresholdSelected(cells_assignment)
+  # par(mfrow=c(4,3))
+  for (geneSetName in names(selectedThresholds)){
+    nBreaks <- 5 # Number of levels in the color palettes
+    ## Color palette for the cells that do not pass the threshold
+    colorPal_Neg <- grDevices::colorRampPalette(c("black","blue", "skyblue"))(nBreaks)
+    ## Color palette for the cells that pass the threshold
+    colorPal_Pos <- grDevices::colorRampPalette(c("pink", "magenta", "red"))(nBreaks)
+    
+    ## Split cells according to their AUC value for the gene set
+    passThreshold <- getAUC(cells_AUC)[geneSetName,] >  selectedThresholds[geneSetName]
+    if(sum(passThreshold) >0 ){
+      aucSplit <- split(getAUC(cells_AUC)[geneSetName,], passThreshold)
+      ## Assign cell color
+      cellColor <- c(setNames(colorPal_Neg[cut(aucSplit[[1]], breaks=nBreaks)],
+                              names(aucSplit[[1]])), setNames(colorPal_Pos[cut(aucSplit[[2]],
+                                                                              breaks=nBreaks)],
+                                                              names(aucSplit[[2]])))
+      
+      plot(reducedDim(sce.obj, "TSNE"), main=geneSetName,
+           sub="Pink/red cells pass the threshold", xlab="", ylab="",
+           col=cellColor[rownames(reducedDim(sce.obj, "TSNE"))], pch=16) 
+    }
+  }
+}
+
+## Annotate clusters
+AnnotateClusters(baron.sce, cell.markers, plot.path = figure.path)
+```
+
+```{r save, eval=FALSE}
+## save SCE object
+# saveRDS(baron.sce, file = paste0("../data/BaronHumanSCE_", Sys.Date(), ".Rds"))
+```
+
+# Resources
+
+https://bioconductor.org/packages/release/bioc/vignettes/scater/inst/doc/overview.html
+
+https://osca.bioconductor.org/clustering.html
+
+https://bioconductor.org/packages/devel/bioc/vignettes/scran/inst/doc/scran.html#6_graph-based_clustering
+
+https://www.bioconductor.org/packages/release/bioc/vignettes/AUCell/inst/doc/AUCell.html
